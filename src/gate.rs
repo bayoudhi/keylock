@@ -85,6 +85,9 @@ impl Gate {
             return false;
         }
         self.locked = locked;
+        // A half-read escape belongs to the old state; flushing it later would
+        // leak a key typed while locked.
+        self.partial.clear();
         self.prefix = None;
         self.clear_typed();
         true
@@ -360,5 +363,23 @@ mod tests {
         gate.set_locked(false);
         gate.set_locked(true);
         assert!(!gate.feed(b"ock\r").events.contains(&Event::Unlock));
+    }
+
+    #[test]
+    fn set_locked_discards_a_partial_escape() {
+        // ESC typed while locked, then `keylock off` before the escape timeout.
+        let mut gate = locked();
+        gate.feed(b"\x1b");
+        assert!(gate.set_locked(false));
+        assert!(!gate.has_partial());
+        assert_eq!(gate.flush(), Output::default());
+        assert_eq!(gate.feed(b"x").forward, b"x");
+
+        // And the other way: a half-typed sequence is not dropped as a key later.
+        let mut gate = unlocked();
+        gate.feed(b"\x1b[");
+        assert!(gate.set_locked(true));
+        assert!(!gate.has_partial());
+        assert_eq!(gate.flush(), Output::default());
     }
 }

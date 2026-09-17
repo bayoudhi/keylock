@@ -1,6 +1,6 @@
 [package]
 name = "keylock-cli"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Run a command behind an input lock so stray keys can't interrupt it"
 license = "MIT"
@@ -30,3 +30,8 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

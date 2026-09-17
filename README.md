@@ -17,6 +17,12 @@ With Homebrew (macOS and Linux):
 brew install bayoudhi/tap/keylock
 ```
 
+With the install script (prebuilt binary for macOS or Linux):
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/bayoudhi/keylock/releases/latest/download/keylock-cli-installer.sh | sh
+```
+
 With Cargo (the crate is `keylock-cli`; the command is `keylock`):
 
 ```sh
@@ -64,6 +70,21 @@ command's exit code (128 + signal number if it was killed by a signal).
 - It only protects commands started through it.
 - While locked, replies from the terminal are dropped too, so a program that
   queries the terminal (for example for the cursor position) gets no answer.
+
+## Releasing
+
+Bump `version` in `Cargo.toml`, commit, then tag and push:
+
+```sh
+git tag -a v0.1.2 -m "keylock v0.1.2" && git push origin master v0.1.2
+```
+
+The Release workflow ([dist](https://github.com/axodotdev/cargo-dist)) builds
+binaries for macOS and Linux (arm64 and x86_64), publishes a GitHub Release with
+an install script, pushes the formula to
+[bayoudhi/homebrew-tap](https://github.com/bayoudhi/homebrew-tap), and publishes
+the crate to crates.io. It needs two repository secrets: `HOMEBREW_TAP_TOKEN`
+and `CARGO_REGISTRY_TOKEN`.
 
 ## License
 

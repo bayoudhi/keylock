@@ -10,7 +10,7 @@ usage:
 
 While a session is locked, all input to the command is dropped.
 Lock from inside the terminal with Ctrl+] then l.
-Unlock with `keylock off NAME`, or type the phrase (default: unlock) and Enter.";
+Unlock with `keylock off NAME`, or type the phrase (default: unlock).";
 
 pub const DEFAULT_PHRASE: &str = "unlock";
 

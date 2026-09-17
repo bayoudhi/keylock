@@ -58,7 +58,7 @@ fn hotkey_locks_and_phrase_unlocks() {
     s.type_bytes(b"\x1dl");
     wait_for_state(dir.path(), "sh", "locked");
     s.type_bytes(b"abc\x03");
-    s.type_bytes(b"unlock\r");
+    s.type_bytes(b"unlock");
     wait_for_state(dir.path(), "sh", "unlocked");
     s.type_bytes(b"XYZ12");
     s.wait_for("GOT[XYZ12]");

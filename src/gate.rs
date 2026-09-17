@@ -9,7 +9,6 @@ const KITTY_CTRL_BRACKET: &[u8] = b"\x1b[93;5u";
 const KITTY_L: &[u8] = b"\x1b[108u";
 const PASTE_START: &[u8] = b"\x1b[200~";
 const PASTE_END: &[u8] = b"\x1b[201~";
-const PHRASE_CAP: usize = 256;
 const MAX_SEQUENCE: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,7 +72,6 @@ pub struct Gate {
     partial: Vec<u8>,
     prefix: Option<Token>,
     typed: Vec<u8>,
-    overflow: bool,
     in_paste: bool,
 }
 
@@ -86,7 +84,6 @@ impl Gate {
             partial: Vec::new(),
             prefix: None,
             typed: Vec::new(),
-            overflow: false,
             in_paste: false,
         }
     }
@@ -187,25 +184,20 @@ impl Gate {
         if !token.is_report() && !out.events.contains(&Event::DroppedInput) {
             out.events.push(Event::DroppedInput);
         }
-        if self.phrase.is_none() {
+        let Some(phrase) = self.phrase.as_deref() else {
             return;
-        }
+        };
         match token {
-            _ if pasting => self.clear_typed(),
-            Token::Byte(b'\r' | b'\n') => {
-                let matched =
-                    !self.overflow && self.phrase.as_deref() == Some(self.typed.as_slice());
-                self.clear_typed();
-                if matched {
+            Token::Byte(byte @ 0x20..=0x7e) if !pasting => {
+                // Only the last `phrase.len()` printable keys can matter.
+                if self.typed.len() == phrase.len() {
+                    self.typed.remove(0);
+                }
+                self.typed.push(byte);
+                if self.typed == phrase {
+                    self.clear_typed();
                     self.locked = false;
                     out.events.push(Event::Unlock);
-                }
-            }
-            Token::Byte(byte @ 0x20..=0x7e) => {
-                if self.typed.len() < PHRASE_CAP {
-                    self.typed.push(byte);
-                } else {
-                    self.overflow = true;
                 }
             }
             _ => self.clear_typed(),
@@ -214,7 +206,6 @@ impl Gate {
 
     fn clear_typed(&mut self) {
         self.typed.clear();
-        self.overflow = false;
     }
 }
 
@@ -295,25 +286,25 @@ mod tests {
         ),
         (no_hotkey, b"\x1dl", b"\x1dl", &[]),
         (locked, b"abc\x03\x1b[A\x1b[<0;3;4M\x1dl", b"", &[]),
-        (locked, b"unlock\rhi", b"hi", &[Event::Unlock]),
-        (locked, b"unlock\nhi", b"hi", &[Event::Unlock]),
-        (locked, b"unl\x1b[Dock\r", b"", &[]),
-        (locked, b"xunlock\r", b"", &[]),
-        (locked, b"\x1b[200~unlock\r\x1b[201~", b"", &[]),
+        // The phrase unlocks as soon as its last letter is typed; no Enter.
+        (locked, b"unlockhi", b"hi", &[Event::Unlock]),
+        (locked, b"unlock\rhi", b"\rhi", &[Event::Unlock]),
+        // Stray keys typed before the phrase don't stop it matching.
+        (locked, b"xq unlockhi", b"hi", &[Event::Unlock]),
+        (locked, b"unlunlock", b"", &[Event::Unlock]),
+        (locked, b"unloc", b"", &[]),
+        (locked, b"unlo\rck", b"", &[]),
+        (locked, b"unl\x1b[Dock", b"", &[]),
+        (locked, b"\x1b[200~unlock\x1b[201~", b"", &[]),
+        (locked, b"\x1b[200~x\x1b[201~unlock", b"", &[Event::Unlock]),
+        (locked, b"\x1b[M !!unlock", b"", &[Event::Unlock]),
         (
             locked,
-            b"\x1b[200~x\x1b[201~unlock\r",
+            b"\x1b]11;rgb:0/0/0\x07unlock",
             b"",
             &[Event::Unlock],
         ),
-        (locked, b"\x1b[M !!unlock\r", b"", &[Event::Unlock]),
-        (
-            locked,
-            b"\x1b]11;rgb:0/0/0\x07unlock\r",
-            b"",
-            &[Event::Unlock],
-        ),
-        (locked_no_phrase, b"unlock\r", b"", &[]),
+        (locked_no_phrase, b"unlock", b"", &[]),
     ];
 
     #[test]
@@ -408,12 +399,12 @@ mod tests {
     }
 
     #[test]
-    fn phrase_buffer_overflow() {
+    fn phrase_matches_after_any_amount_of_stray_typing() {
         let mut gate = locked();
-        let mut input = vec![b'x'; 256];
-        input.extend_from_slice(b"unlock\r");
-        assert!(!gate.feed(&input).events.contains(&Event::Unlock));
-        assert!(gate.feed(b"unlock\r").events.contains(&Event::Unlock));
+        let mut input = vec![b'x'; 10_000];
+        input.extend_from_slice(b"unlock");
+        assert!(gate.feed(&input).events.contains(&Event::Unlock));
+        assert!(!gate.is_locked());
     }
 
     #[test]

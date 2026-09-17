@@ -26,7 +26,7 @@ keylock run -- ./migrate.sh              # start unlocked, lock later
 |----|----|
 | Lock from inside the terminal | Ctrl+] then `l` |
 | Lock from another shell | `keylock on migrate.sh` |
-| Unlock from inside the terminal | type `unlock` then Enter |
+| Unlock from inside the terminal | type `unlock` (no Enter needed) |
 | Unlock from another shell | `keylock off migrate.sh` |
 | See sessions | `keylock ls` |
 | Check one session | `keylock status migrate.sh` |

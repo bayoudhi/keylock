@@ -10,6 +10,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::ExitStatusExt;
+use std::process::{Child, ExitStatus};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -18,6 +19,8 @@ const STDOUT: RawFd = 1;
 const BEL: u8 = 0x07;
 const ESCAPE_TIMEOUT: Duration = Duration::from_millis(25);
 const FLASH: Duration = Duration::from_secs(2);
+/// How long to keep copying output after the command exits.
+const DRAIN: Duration = Duration::from_millis(100);
 const MAX_PENDING_INPUT: usize = 64 * 1024;
 const FORWARDED_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGINT, libc::SIGQUIT];
 
@@ -35,14 +38,14 @@ pub enum Failure {
 }
 
 enum End {
-    ChildDone,
+    ChildDone(ExitStatus),
     HangUp,
 }
 
 pub fn run(config: Config, listener: &Listener) -> Result<i32, Failure> {
     let size = pty::window_size(STDIN).map_err(Failure::Io)?;
     let signals = install_signal_handlers().map_err(Failure::Io)?;
-    let pty::Spawned { master, mut child } =
+    let pty::Spawned { master, child } =
         pty::spawn(&config.command, &[("KEYLOCK_NAME", listener.name())], &size)
             .map_err(Failure::Spawn)?;
     pty::set_nonblocking(master.as_raw_fd()).map_err(Failure::Io)?;
@@ -51,10 +54,12 @@ pub fn run(config: Config, listener: &Listener) -> Result<i32, Failure> {
     let mut relay = Relay {
         listener,
         master,
+        pty_open: true,
         signals,
         gate: Gate::new(config.locked, config.hotkey, config.phrase),
         title: TitleFilter::default(),
         child_pid: child.id() as libc::pid_t,
+        child,
         command_line: config.command.join(" "),
         to_child: Vec::new(),
         to_user: Vec::new(),
@@ -62,22 +67,23 @@ pub fn run(config: Config, listener: &Listener) -> Result<i32, Failure> {
         flash_until: None,
         next_flash: Instant::now(),
     };
-    let end = relay.run_loop();
-    if matches!(end, Ok(End::ChildDone)) {
-        relay.reset_title();
-    }
+    let end = relay.run_loop().and_then(|end| {
+        if matches!(end, End::ChildDone(_)) {
+            relay.drain_child_output()?;
+            relay.reset_title();
+        }
+        Ok(end)
+    });
     // Closing the master hangs up the command's terminal, as closing a
-    // terminal window would.
+    // terminal window would. After the command exits, that reaches only what
+    // it left running in the background.
     drop(relay);
     drop(raw);
 
     match end.map_err(Failure::Io)? {
-        End::ChildDone => {
-            let status = child.wait().map_err(Failure::Io)?;
-            Ok(status
-                .code()
-                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)))
-        }
+        End::ChildDone(status) => Ok(status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))),
         End::HangUp => Ok(128 + libc::SIGHUP),
     }
 }
@@ -85,10 +91,14 @@ pub fn run(config: Config, listener: &Listener) -> Result<i32, Failure> {
 struct Relay<'a> {
     listener: &'a Listener,
     master: File,
+    /// False once no process has the command's side of the pty open. The
+    /// master stays open regardless: closing it would hang up the command.
+    pty_open: bool,
     signals: UnixStream,
     gate: Gate,
     title: TitleFilter,
     child_pid: libc::pid_t,
+    child: Child,
     command_line: String,
     /// Input waiting for the command to read it.
     to_child: Vec<u8>,
@@ -106,6 +116,13 @@ impl Relay<'_> {
             self.emit_queued()?;
         }
         loop {
+            // A negative descriptor is ignored by poll. Linux keeps reporting
+            // POLLHUP on a master whose other side is closed.
+            let master_fd = if self.pty_open {
+                self.master.as_raw_fd()
+            } else {
+                -1
+            };
             let master_events = if self.to_child.is_empty() {
                 libc::POLLIN
             } else {
@@ -113,7 +130,7 @@ impl Relay<'_> {
             };
             let mut fds = [
                 poll_fd(STDIN, libc::POLLIN),
-                poll_fd(self.master.as_raw_fd(), master_events),
+                poll_fd(master_fd, master_events),
                 poll_fd(self.listener.as_raw_fd(), libc::POLLIN),
                 poll_fd(self.signals.as_raw_fd(), libc::POLLIN),
             ];
@@ -145,8 +162,8 @@ impl Relay<'_> {
             if ready(1, libc::POLLOUT) {
                 self.write_to_child()?;
             }
-            if ready(1, hangup_or_in) && self.read_child()? {
-                return Ok(End::ChildDone);
+            if ready(1, hangup_or_in) {
+                self.read_child()?;
             }
             if ready(2, libc::POLLIN) {
                 self.serve_control();
@@ -199,6 +216,10 @@ impl Relay<'_> {
     }
 
     fn write_to_child(&mut self) -> io::Result<()> {
+        if !self.pty_open {
+            // Nothing is left to read it.
+            self.to_child.clear();
+        }
         if self.to_child.is_empty() {
             return Ok(());
         }
@@ -214,21 +235,36 @@ impl Relay<'_> {
         Ok(())
     }
 
-    /// Returns `true` once the command's side of the pty is closed.
+    /// Copies the command's output to the user. Returns `true` if there was
+    /// any; notes when the command's side of the pty has closed.
     fn read_child(&mut self) -> io::Result<bool> {
         let mut buf = [0u8; 65536];
         match self.master.read(&mut buf) {
-            Ok(0) => Ok(true),
+            Ok(0) => {
+                self.pty_open = false;
+                Ok(false)
+            }
             Ok(n) => {
                 let out = self.title.filter(&buf[..n], self.gate.is_locked());
                 write_all_fd(STDOUT, &out)?;
-                Ok(false)
+                Ok(true)
             }
             Err(e) if retryable(&e) => Ok(false),
             // Linux reports a closed pty as EIO rather than end-of-file.
-            Err(e) if e.raw_os_error() == Some(libc::EIO) => Ok(true),
+            Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+                self.pty_open = false;
+                Ok(false)
+            }
             Err(e) => Err(e),
         }
+    }
+
+    /// After the command exits: copies what it wrote last, without waiting
+    /// on anything it left running that still holds the pty.
+    fn drain_child_output(&mut self) -> io::Result<()> {
+        let deadline = Instant::now() + DRAIN;
+        while self.pty_open && Instant::now() < deadline && self.read_child()? {}
+        Ok(())
     }
 
     fn serve_control(&mut self) {
@@ -259,6 +295,8 @@ impl Relay<'_> {
         };
         for &signal in &buf[..n] {
             match libc::c_int::from(signal) {
+                // Checked below, after every wake-up.
+                libc::SIGCHLD => {}
                 libc::SIGWINCH => {
                     if let Ok(size) = pty::window_size(STDIN) {
                         let _ = pty::set_window_size(self.master.as_raw_fd(), &size);
@@ -272,7 +310,9 @@ impl Relay<'_> {
                 }
             }
         }
-        Ok(None)
+        // The session ends when the command exits, not when it closes the
+        // terminal: it may redirect its output and keep running.
+        Ok(self.child.try_wait()?.map(End::ChildDone))
     }
 
     fn on_timers(&mut self) -> io::Result<()> {
@@ -407,7 +447,7 @@ fn install_signal_handlers() -> io::Result<UnixStream> {
     SIGNAL_PIPE.store(writer.as_raw_fd(), Ordering::Relaxed);
     // The handlers write to this descriptor for the rest of the process.
     std::mem::forget(writer);
-    let signals = [libc::SIGWINCH, libc::SIGHUP]
+    let signals = [libc::SIGWINCH, libc::SIGHUP, libc::SIGCHLD]
         .into_iter()
         .chain(FORWARDED_SIGNALS);
     for signal in signals {

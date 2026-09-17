@@ -3,7 +3,7 @@ mod common;
 use common::{keylock, recorder, stderr, stdout, wait_for_state, Session, BIN};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SETTLE: Duration = Duration::from_millis(300);
 
@@ -179,6 +179,77 @@ fn signals() {
     trapped.signal(libc::SIGTERM);
     trapped.wait_for("TRAPPED");
     assert_eq!(trapped.wait_exit().code(), Some(3));
+}
+
+#[test]
+fn runs_until_the_command_exits_even_after_it_lets_go_of_the_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    let start = Instant::now();
+    let s = Session::start(
+        dir.path(),
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "echo READY; exec sleep 1 </dev/null >/dev/null 2>&1",
+        ],
+    );
+    s.wait_for("READY");
+    assert_eq!(s.wait_exit().code(), Some(0));
+    assert!(start.elapsed() >= Duration::from_secs(1));
+}
+
+#[test]
+fn output_written_just_before_exit_is_not_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = Session::start(
+        dir.path(),
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "i=0; while [ $i -lt 3000 ]; do echo line$i; i=$((i+1)); done; echo END; exit 4",
+        ],
+    );
+    assert_eq!(s.exit_status().code(), Some(4));
+    s.wait_for("line2999\r\nEND\r\n");
+}
+
+#[test]
+fn signals_still_reach_a_command_that_let_go_of_the_terminal() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Session::start(
+        dir.path(),
+        &[
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "echo READY; exec sleep 30 </dev/null >/dev/null 2>&1",
+        ],
+    );
+    s.wait_for("READY");
+    // Give keylock time to see the command's side of the pty close.
+    thread::sleep(SETTLE);
+    s.signal(libc::SIGTERM);
+    assert_eq!(s.wait_exit().code(), Some(143));
+}
+
+#[test]
+fn hangup_ends_the_session_and_removes_the_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Session::start(
+        dir.path(),
+        &["run", "--", "sh", "-c", "echo READY; sleep 30"],
+    );
+    s.wait_for("READY");
+    let socket = dir.path().join("keylock/sh.sock");
+    assert!(socket.exists());
+    s.signal(libc::SIGHUP);
+    assert_eq!(s.wait_exit().code(), Some(129));
+    assert!(!socket.exists());
 }
 
 #[test]

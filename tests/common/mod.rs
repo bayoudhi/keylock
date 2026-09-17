@@ -122,6 +122,11 @@ impl Session {
     }
 
     pub fn wait_exit(mut self) -> ExitStatus {
+        self.exit_status()
+    }
+
+    /// Waits for keylock to exit, keeping the session for reading its output.
+    pub fn exit_status(&mut self) -> ExitStatus {
         let start = Instant::now();
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {

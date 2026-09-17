@@ -54,6 +54,8 @@ command's exit code (128 + signal number if it was killed by a signal).
   passed with `--phrase`.
 - `keylock` can't stop the terminal, tab or pane itself from being closed.
 - It only protects commands started through it.
+- While locked, replies from the terminal are dropped too, so a program that
+  queries the terminal (for example for the cursor position) gets no answer.
 
 ## License
 

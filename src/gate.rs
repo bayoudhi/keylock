@@ -39,6 +39,25 @@ impl Token {
         }
     }
 
+    /// Something the terminal sends on its own (focus changes, mouse
+    /// reports, replies to queries) rather than a key the user pressed.
+    fn is_report(&self) -> bool {
+        let Token::Seq(s) = self else {
+            return false;
+        };
+        let last = s[s.len() - 1];
+        match s[1] {
+            // X10 mouse: ESC [ M and three raw bytes, whatever they are.
+            b'[' if s.get(2) == Some(&b'M') => s.len() == 6,
+            // Focus, SGR mouse, cursor position, device attributes, window reports.
+            b'[' => s.len() > 2 && b"IOMmRct".contains(&last),
+            // Terminated OSC, DCS, APC and PM strings. An unterminated `ESC P`
+            // flushed on timeout is Alt+Shift+P.
+            b']' | b'P' | b'_' | b'^' => string_terminated(s),
+            _ => false,
+        }
+    }
+
     fn is(&self, byte: u8, kitty: &[u8]) -> bool {
         match self {
             Token::Byte(b) => *b == byte,
@@ -165,7 +184,7 @@ impl Gate {
     }
 
     fn handle_locked(&mut self, token: Token, pasting: bool, out: &mut Output) {
-        if !out.events.contains(&Event::DroppedInput) {
+        if !token.is_report() && !out.events.contains(&Event::DroppedInput) {
             out.events.push(Event::DroppedInput);
         }
         if self.phrase.is_none() {
@@ -213,12 +232,16 @@ fn sequence_complete(seq: &[u8]) -> bool {
             _ => (0x40..=0x7e).contains(&last),
         },
         b'O' => seq.len() == 3,
-        b']' | b'P' | b'_' | b'^' => {
-            (seq[1] == b']' && last == 0x07)
-                || (seq.len() >= 4 && seq[seq.len() - 2] == ESC && last == b'\\')
-        }
+        b']' | b'P' | b'_' | b'^' => string_terminated(seq),
         _ => true,
     }
+}
+
+/// An OSC, DCS, APC or PM string ends with ST (`ESC \\`), or BEL for OSC.
+fn string_terminated(seq: &[u8]) -> bool {
+    let last = seq[seq.len() - 1];
+    (seq[1] == b']' && last == 0x07)
+        || (seq.len() >= 4 && seq[seq.len() - 2] == ESC && last == b'\\')
 }
 
 #[cfg(test)]
@@ -327,6 +350,61 @@ mod tests {
         let mut gate = locked();
         assert_eq!(gate.feed(b"abc").events, vec![Event::DroppedInput]);
         assert_eq!(unlocked().feed(b"abc").events, vec![]);
+    }
+
+    #[test]
+    fn terminal_reports_are_dropped_silently() {
+        let silent: &[&[u8]] = &[
+            b"\x1b[I",                  // focus in
+            b"\x1b[O",                  // focus out
+            b"\x1b[M !!",               // X10 mouse
+            b"\x1b[<0;3;4M",            // SGR mouse press
+            b"\x1b[<0;3;4m",            // SGR mouse release
+            b"\x1b[12;40R",             // cursor position report
+            b"\x1b[?62;22c",            // device attributes
+            b"\x1b[8;24;80t",           // window size report
+            b"\x1b]11;rgb:0/0/0\x07",   // OSC colour reply, BEL
+            b"\x1b]11;rgb:0/0/0\x1b\\", // OSC colour reply, ST
+            b"\x1bP1$r0m\x1b\\",        // DCS
+            b"\x1b_Gi=1;OK\x1b\\",      // APC
+            b"\x1b^x\x1b\\",            // PM
+        ];
+        let noisy: &[&[u8]] = &[
+            b"a",
+            b"\x03",
+            b"\r",
+            b"\x1b",
+            b"\x1b[A",
+            b"\x1bOP",
+            b"\x1b[3~",
+            b"\x1b[97;5u",
+            b"\x1b[200~x\x1b[201~",
+            b"\x1bP",              // Alt+Shift+P, not a DCS string
+            b"\x1b[I\x1b[12;40Ra", // a key among reports still rings
+        ];
+        let events = |input: &[u8]| {
+            let mut gate = locked();
+            let mut out = gate.feed(input);
+            let flushed = gate.flush();
+            out.forward.extend(flushed.forward);
+            out.events.extend(flushed.events);
+            assert_eq!(out.forward, b"", "{input:?} was forwarded");
+            out.events.contains(&Event::DroppedInput)
+        };
+        for input in silent {
+            assert!(
+                !events(input),
+                "{:?} rang the bell",
+                String::from_utf8_lossy(input)
+            );
+        }
+        for input in noisy {
+            assert!(
+                events(input),
+                "{:?} was silent",
+                String::from_utf8_lossy(input)
+            );
+        }
     }
 
     #[test]

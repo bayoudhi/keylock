@@ -267,6 +267,26 @@ pub fn list(dir: &Path) -> Vec<(String, String)> {
 mod tests {
     use super::*;
     use std::thread;
+    use std::time::Instant;
+
+    /// Binds a `UnixListener` at `path` and drops it to simulate a session
+    /// whose owner died without cleaning up, then waits until a connect to
+    /// `path` actually fails. A forked pty-test child can hold a CLOEXEC dup
+    /// of the just-dropped listener fd until it execs, during which a
+    /// connect can still succeed — so dropping alone doesn't guarantee the
+    /// socket looks stale yet.
+    fn stale_socket(path: &Path) {
+        drop(UnixListener::bind(path).unwrap());
+        let start = Instant::now();
+        while UnixStream::connect(path).is_ok() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "socket at {} never went stale",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
 
     /// Answers requests on `listener` until `client` finishes, then returns its result.
     fn with_server<T: Send + 'static>(
@@ -390,7 +410,7 @@ mod tests {
         assert_eq!(second.name(), "mig-2");
 
         // A socket file whose owner died without cleaning up.
-        drop(UnixListener::bind(tmp.path().join("old.sock")).unwrap());
+        stale_socket(&tmp.path().join("old.sock"));
         assert!(tmp.path().join("old.sock").exists());
         assert_eq!(Listener::bind(tmp.path(), "old").unwrap().name(), "old");
         drop((first, second));
@@ -400,7 +420,7 @@ mod tests {
     fn list_reports_live_sessions_and_removes_stale_ones() {
         let tmp = tempfile::tempdir().unwrap();
         let listener = Listener::bind(tmp.path(), "live").unwrap();
-        drop(UnixListener::bind(tmp.path().join("dead.sock")).unwrap());
+        stale_socket(&tmp.path().join("dead.sock"));
         let dir = tmp.path().to_path_buf();
         let sessions = with_server(&listener, false, move || list(&dir));
         assert_eq!(

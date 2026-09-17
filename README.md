@@ -11,8 +11,16 @@ Herdr and over SSH.
 
 ## Install
 
+With Homebrew (macOS and Linux):
+
 ```sh
-cargo install --git https://github.com/bayoudhi/keylock
+brew install bayoudhi/tap/keylock
+```
+
+With Cargo (the crate is `keylock-cli`; the command is `keylock`):
+
+```sh
+cargo install keylock-cli
 ```
 
 ## Use

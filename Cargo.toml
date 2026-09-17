@@ -1,10 +1,23 @@
 [package]
-name = "keylock"
-version = "0.1.0"
+name = "keylock-cli"
+version = "0.1.1"
 edition = "2021"
 description = "Run a command behind an input lock so stray keys can't interrupt it"
 license = "MIT"
 repository = "https://github.com/bayoudhi/keylock"
+homepage = "https://github.com/bayoudhi/keylock"
+readme = "README.md"
+keywords = ["terminal", "pty", "lock", "input", "cli"]
+categories = ["command-line-utilities"]
+include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"]
+
+[lib]
+name = "keylock"
+path = "src/lib.rs"
+
+[[bin]]
+name = "keylock"
+path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"

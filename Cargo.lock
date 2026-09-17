@@ -42,8 +42,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "keylock"
-version = "0.1.0"
+name = "keylock-cli"
+version = "0.1.1"
 dependencies = [
  "libc",
  "tempfile",

@@ -56,7 +56,7 @@ pub fn open_pty(size: &libc::winsize) -> io::Result<(OwnedFd, OwnedFd)> {
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            &mut size,
+            std::ptr::addr_of_mut!(size),
         )
     };
     if rc == -1 {

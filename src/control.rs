@@ -126,6 +126,25 @@ pub fn default_name(command: &str) -> String {
     }
 }
 
+/// Bytes available for a session name in `dir`: the socket path must fit
+/// `sun_path` with its terminating NUL, and the name must stay valid.
+fn name_room(dir: &Path) -> usize {
+    // SAFETY: sockaddr_un is plain data; a zeroed one is valid.
+    let addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let max_path = addr.sun_path.len() - 1;
+    // Everything but the name: the directory, a separator and `.sock`.
+    let used = dir.join("x.sock").as_os_str().len() - 1;
+    max_path.saturating_sub(used).min(MAX_NAME)
+}
+
+fn truncate(s: &str, max: usize) -> &str {
+    let mut end = max.min(s.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 pub struct Listener {
     listener: UnixListener,
     path: PathBuf,
@@ -133,15 +152,26 @@ pub struct Listener {
 }
 
 impl Listener {
+    /// Binds `dir/NAME.sock`, where NAME is `base` shortened to fit the
+    /// socket path limit and, if taken by a live session, suffixed `-2`, `-3`, ….
     pub fn bind(dir: &Path, base: &str) -> Result<Listener, String> {
+        let room = name_room(dir);
         let mut attempt = 1;
         loop {
-            let name = if attempt == 1 {
-                base.to_string()
+            let suffix = if attempt == 1 {
+                String::new()
             } else {
-                format!("{base}-{attempt}")
+                format!("-{attempt}")
             };
             attempt += 1;
+            let Some(keep) = room.checked_sub(suffix.len()).filter(|&keep| keep > 0) else {
+                return Err(format!(
+                    "cannot create a session socket in {}: the path is too long \
+                     (set a shorter $TMPDIR or $XDG_RUNTIME_DIR)",
+                    dir.display()
+                ));
+            };
+            let name = format!("{}{suffix}", truncate(base, keep));
             let path = dir.join(format!("{name}.sock"));
             if fs::symlink_metadata(&path).is_ok() {
                 if UnixStream::connect(&path).is_ok() {
@@ -252,8 +282,12 @@ pub fn list(dir: &Path) -> Vec<(String, String)> {
     names.sort();
     names
         .into_iter()
+        // keylock never creates such names; leave whatever they are alone.
+        .filter(|name| valid_name(name))
         .filter_map(|name| match send(dir, &name, Request::Status) {
             Ok(state) => Some((name, state)),
+            // For a valid name this means the connection was refused or the
+            // file is gone: nobody is listening.
             Err(SendError::NoSession) => {
                 let _ = fs::remove_file(dir.join(format!("{name}.sock")));
                 None
@@ -414,6 +448,71 @@ mod tests {
         assert!(tmp.path().join("old.sock").exists());
         assert_eq!(Listener::bind(tmp.path(), "old").unwrap().name(), "old");
         drop((first, second));
+    }
+
+    /// A directory under `tmp` whose socket paths leave exactly `room` bytes
+    /// for the session name.
+    fn dir_with_room(tmp: &Path, room: usize) -> PathBuf {
+        // SAFETY: sockaddr_un is plain data.
+        let addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        let max_path = addr.sun_path.len() - 1;
+        // tmp + "/" + dir + "/" + name + ".sock"
+        let used = tmp.as_os_str().len() + 1 + 1 + room + ".sock".len();
+        assert!(used < max_path, "temp dir {} is too long", tmp.display());
+        let dir = tmp.join("d".repeat(max_path - used));
+        fs::create_dir(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn long_names_are_shortened_to_fit_the_socket_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = dir_with_room(tmp.path(), 20);
+        let base = "n".repeat(64);
+        let first = Listener::bind(&dir, &base).unwrap();
+        assert_eq!(first.name(), "n".repeat(20));
+        assert!(dir.join(format!("{}.sock", first.name())).exists());
+        let second = Listener::bind(&dir, &base).unwrap();
+        assert_eq!(second.name(), format!("{}-2", "n".repeat(18)));
+        let name = second.name().to_string();
+        let reply = with_server(&second, false, move || {
+            send(&dir, &name, Request::Status).unwrap()
+        });
+        assert_eq!(reply, "unlocked pid=7 cmd=sh");
+        drop(first);
+    }
+
+    #[test]
+    fn suffixed_names_stay_valid() {
+        // A short directory, so the name limit applies before the path limit.
+        let tmp = tempfile::tempdir_in("/tmp").unwrap();
+        let base = "a".repeat(MAX_NAME);
+        let _first = Listener::bind(tmp.path(), &base).unwrap();
+        let second = Listener::bind(tmp.path(), &base).unwrap();
+        assert!(valid_name(second.name()), "{}", second.name());
+        assert!(second.name().ends_with("-2"), "{}", second.name());
+    }
+
+    #[test]
+    fn directory_too_long_for_any_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = dir_with_room(tmp.path(), 0);
+        let err = Listener::bind(&dir, "mig").err().unwrap();
+        assert!(err.contains(&dir.display().to_string()), "{err}");
+        assert!(err.contains("$TMPDIR"), "{err}");
+        assert!(err.contains("$XDG_RUNTIME_DIR"), "{err}");
+    }
+
+    #[test]
+    fn list_never_removes_a_live_socket() {
+        let tmp = tempfile::tempdir_in("/tmp").unwrap();
+        // Names `send` refuses must not be mistaken for dead sessions.
+        let path = tmp
+            .path()
+            .join(format!("{}.sock", "z".repeat(MAX_NAME + 2)));
+        let _live = UnixListener::bind(&path).unwrap();
+        assert!(list(tmp.path()).is_empty());
+        assert!(path.exists());
     }
 
     #[test]

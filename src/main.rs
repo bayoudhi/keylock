@@ -61,17 +61,24 @@ fn run(options: RunOptions) -> i32 {
     match relay::run(config, &listener) {
         Ok(code) => code,
         Err(relay::Failure::Spawn(e)) => {
-            eprintln!("keylock: {program}: {e}");
-            if e.kind() == io::ErrorKind::NotFound {
-                127
-            } else {
-                126
-            }
+            let (code, message) = spawn_failure(&program, &e);
+            eprintln!("{message}");
+            code
         }
         Err(relay::Failure::Io(e)) => {
             eprintln!("keylock: {e}");
             1
         }
+    }
+}
+
+/// Exit code and message for a command that could not be started.
+fn spawn_failure(program: &str, e: &io::Error) -> (i32, String) {
+    match e.kind() {
+        io::ErrorKind::NotFound => (127, format!("keylock: {program}: {e}")),
+        io::ErrorKind::PermissionDenied => (126, format!("keylock: {program}: {e}")),
+        // openpty, setsid and the like failed: not a problem with the command.
+        _ => (1, format!("keylock: {e}")),
     }
 }
 
@@ -109,4 +116,31 @@ fn ls() -> i32 {
         println!("{name}  {}", columns.join("  "));
     }
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn spawn_failures() {
+        let not_found = io::Error::from(io::ErrorKind::NotFound);
+        assert_eq!(spawn_failure("m.sh", &not_found).0, 127);
+        assert!(spawn_failure("m.sh", &not_found)
+            .1
+            .starts_with("keylock: m.sh: "));
+
+        let denied = io::Error::from(io::ErrorKind::PermissionDenied);
+        assert_eq!(spawn_failure("m.sh", &denied).0, 126);
+        assert!(spawn_failure("m.sh", &denied)
+            .1
+            .starts_with("keylock: m.sh: "));
+
+        // openpty, setsid and the like: not the command's fault.
+        let other = io::Error::from_raw_os_error(libc::EMFILE);
+        assert_eq!(
+            spawn_failure("m.sh", &other),
+            (1, format!("keylock: {other}"))
+        );
+    }
 }

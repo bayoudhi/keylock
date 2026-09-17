@@ -86,7 +86,7 @@ fn lock_shows_in_the_title_and_typing_rings_the_bell() {
     let dir = tempfile::tempdir().unwrap();
     let s = Session::start(
         dir.path(),
-        &["run", "--locked", "--", "sh", "-c", "echo READY; sleep 5"],
+        &["run", "--locked", "--", "sh", "-c", "echo READY; sleep 30"],
     );
     s.wait_for("\x1b]2;🔒 sh\x07");
     s.wait_for("READY");
